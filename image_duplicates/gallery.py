@@ -54,13 +54,55 @@ _DEFAULT_GROUP_ROLE = int(Qt.ItemDataRole.UserRole)
 
 _THUMB_PIXEL = 200
 _THUMB_CACHE: dict[str, QPixmap] = {}
+_THUMB_DISK_DIR: str | None = None
+
+
+def _thumb_disk_dir() -> str:
+    """Persistent thumbnails dir under the same root as the scan index."""
+    global _THUMB_DISK_DIR
+    if _THUMB_DISK_DIR is None:
+        base = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.AppDataLocation
+        )
+        _THUMB_DISK_DIR = os.path.join(base, "thumbs") if base else ""
+    return _THUMB_DISK_DIR
+
+
+def _thumb_disk_path(path: str) -> str:
+    root = _thumb_disk_dir()
+    if not root:
+        return ""
+    stat_key = ""
+    try:
+        st = os.stat(path)
+        stat_key = f"-{st.st_size}-{st.st_mtime_ns}"
+    except OSError:
+        pass
+    digest = hashlib.sha256(
+        os.path.normcase(os.path.abspath(path)).encode("utf-8")
+    ).hexdigest()[:24]
+    return os.path.join(root, f"thumb-{digest}{stat_key}.png")
 
 
 def _thumb_pixmap(path: str) -> QPixmap:
     pixmap = _THUMB_CACHE.get(path)
     if pixmap is not None:
         return pixmap
+
+    disk_path = _thumb_disk_path(path)
+    if disk_path and os.path.isfile(disk_path):
+        candidate = QPixmap(disk_path)
+        if not candidate.isNull():
+            _THUMB_CACHE[path] = candidate
+            return candidate
+
     pixmap = _build_pixmap(path, _THUMB_PIXEL)
+    if disk_path and not pixmap.isNull():
+        try:
+            os.makedirs(os.path.dirname(disk_path), exist_ok=True)
+            pixmap.save(disk_path, "PNG")
+        except OSError:
+            pass
     _THUMB_CACHE[path] = pixmap
     return pixmap
 
