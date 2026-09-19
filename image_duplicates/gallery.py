@@ -742,10 +742,17 @@ class GalleryView(QWidget):
             return
         records = list(self.model.records)
         viewer = ImageViewer(records, index.row(), self)
+        # The viewer deletes single images; the window handles the move in the
+        # same way it handles the ticked ones.
+        viewer.delete_requested.connect(self.delete_requested)
         viewer.show()
 
 
 class ImageViewer(QDialog):
+    """Full-size preview of one image, with prev/next and a delete button."""
+
+    delete_requested = pyqtSignal(list)
+
     def __init__(
         self,
         records: list[ImageRecord],
@@ -777,11 +784,20 @@ class ImageViewer(QDialog):
         prev_button.clicked.connect(self._previous)
         next_button.clicked.connect(self._next)
 
+        delete_button = QPushButton("Delete This Image")
+        delete_button.setToolTip(
+            "Move the image on screen to the recycle bin, where it stays "
+            "recoverable. The gallery re-scans afterwards."
+        )
+        delete_button.clicked.connect(self._delete_current)
+
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         buttons.addWidget(prev_button)
         buttons.addWidget(next_button)
         buttons.addStretch(1)
+        # Kept apart from Prev/Next so it is not hit by accident.
+        buttons.addWidget(delete_button)
 
         self.layout = QVBoxLayout(self)
         self.layout.addWidget(scroll, 1)
@@ -790,9 +806,23 @@ class ImageViewer(QDialog):
 
         QShortcut(QKeySequence("Left"), self, activated=self._previous)
         QShortcut(QKeySequence("Right"), self, activated=self._next)
+        QShortcut(QKeySequence("Delete"), self, activated=self._delete_current)
 
         self._records_on_show = True
         self._show_current()
+
+    def _delete_current(self) -> None:
+        """Ask for the image on screen to be trashed, then close if it went.
+
+        The signal is delivered straight away, so by the time it returns the
+        user has either confirmed the move - the file is gone, and this preview
+        closes because the list behind it is stale - or cancelled, in which case
+        the file is still there and nothing here changes.
+        """
+        record = self._records[self._index]
+        self.delete_requested.emit([record.path])
+        if not os.path.isfile(record.path):
+            self.accept()
 
     def _show_current(self) -> None:
         self._records_on_show = False

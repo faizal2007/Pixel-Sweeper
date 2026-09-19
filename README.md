@@ -112,10 +112,15 @@ and the matching thumbnails appear on the right.
 | Tick several at once | Rubber-band or Ctrl/Shift-click, then press **Space** |
 | Delete what is ticked | **Delete Checked (n)**, or press **Delete** |
 | Preview an image full size | Double-click a thumbnail; **Left/Right** arrows move between images |
+| Delete the image on screen | In the preview, **Delete This Image** or press **Delete** |
 | Stop a long scan | **Cancel** in the toolbar |
 
 Deleting asks for confirmation with a count and total size, moves the files to the recycle bin, then
 re-scans so the gallery reflects reality. Files you did not tick are never touched.
+
+The full-size preview deletes the image it is showing, without needing to tick it first — useful when you
+want a closer look before deciding. It closes itself once the file has gone, since the list behind it is
+now stale, and stays open if you cancel the confirmation.
 
 **Cancel** stops the running scan *and* drops any folder queued behind it. Since the hashes already
 computed are kept, cancelling a long scan doesn't throw the work away. If results were on screen
