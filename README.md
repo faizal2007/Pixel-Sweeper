@@ -79,9 +79,17 @@ flowchart LR
 1. **Every image is hashed twice** — a DCT-based pHash (32×32 greyscale, low-frequency 8×8 block,
    median threshold) and a cheap horizontal dHash. Both are 64-bit values.
 2. **Images sharing an exact pHash** form a bucket.
-3. **Buckets are merged** when their hashes are within a Hamming distance of **10 bits**. A BK-tree
-   keeps that pairwise search fast on large libraries.
+3. **Buckets are merged** when their hashes are within the **similarity threshold** — 10 bits by default, adjusting in the toolbar. A BK-tree keeps that pairwise search fast on large libraries. Because every hash is already known, changing the threshold re-groups instantly without re-reading a single file.
 4. **Buckets with two or more images** become duplicate groups; the rest are the unique set.
+
+The walk covers the whole tree at any depth. Folder links (symlinks and junctions) are followed, so a
+subfolder kept behind one is still scanned, with a set of real paths preventing a link cycle from being
+walked twice or looping. Folders that cannot be read are reported rather than skipped in silence.
+
+Large photos are handled: the dimensions come from the file header, and JPEGs are decoded at reduced
+scale, so a 200 MP phone photo costs a few MB of memory instead of roughly 600 MB. Pillow's default
+pixel ceiling is raised past any real camera, since it otherwise refuses such files as suspected
+"decompression bombs" — which is exactly what a 200 MP photo looks like by its numbers.
 
 Hashing runs in a thread pool, which overlaps file reading and image decoding across images. Note that
 the DCT itself is pure Python, so that part is serialised by the GIL — the pool mainly hides the I/O
@@ -100,27 +108,36 @@ only does the remaining work.
 
 ## Using the gallery
 
-Select a node in the tree on the left — a duplicate group, or **Click to browse all unique images** —
-and the matching thumbnails appear on the right.
+Select a node in the tree on the left — a duplicate group, **Unique Images**, or **Scanned Folders** — and
+the matching thumbnails appear on the right. Group headings name the subfolder the image came from, so you
+can tell at a glance which folders a scan covered.
 
 | Action | How |
 | --- | --- |
+| Browse everything one folder contributed | **Scanned Folders** in the tree lists every folder that produced an image, with its count |
+| Change how alike two images must be | **Similarity threshold** in the toolbar, 0–32 bits |
 | Tick / untick an image | Click the box in the caption row under the thumbnail |
 | Tick everything | **Check All** |
 | Clear all ticks | **Uncheck All** |
 | Keep one copy of a group | **Check All Except First** — ticks every image but the first |
 | Tick several at once | Rubber-band or Ctrl/Shift-click, then press **Space** |
 | Delete what is ticked | **Delete Checked (n)**, or press **Delete** |
-| Preview an image full size | Double-click a thumbnail; **Left/Right** arrows move between images |
+| Preview an image | Double-click a thumbnail; it opens fitted to the window |
+| See a photo at 1:1 | **Actual size** in the preview — it then scrolls both ways |
+| Move between images | **Left/Right** arrows, or **Prev**/**Next** |
 | Delete the image on screen | In the preview, **Delete This Image** or press **Delete** |
 | Stop a long scan | **Cancel** in the toolbar |
 
 Deleting asks for confirmation with a count and total size, moves the files to the recycle bin, then
 re-scans so the gallery reflects reality. Files you did not tick are never touched.
 
-The full-size preview deletes the image it is showing, without needing to tick it first — useful when you
-want a closer look before deciding. It closes itself once the file has gone, since the list behind it is
-now stale, and stays open if you cancel the confirmation.
+The preview opens **fitted to the window**, so the first thing you see is the whole picture rather than a
+corner of it, and it re-fits as you resize the window. **Actual size** switches to 1:1 with scroll bars in
+both directions, and the caption always says which you are looking at — `fitted to the window (776 x 194)`
+or `shown at full size`. A photo smaller than the window is left at its own size rather than being stretched.
+The preview can also delete the image on screen without ticking it first — useful when you want a closer
+look before deciding — closes itself once the file has gone, since the list behind it is now stale, and
+stays open if you cancel the confirmation.
 
 **Cancel** stops the running scan *and* drops any folder queued behind it. Since the hashes already
 computed are kept, cancelling a long scan doesn't throw the work away. If results were on screen
@@ -174,11 +191,20 @@ widget.render(pixmap)                   # render to a pixmap to assert on pixels
 was actually painted — which is how the tick box was confirmed never to overlap the picture.
 
 Supported image types: `.jpg`, `.jpeg`, `.png`, `.gif`, `.bmp`, `.webp`, `.tif`, `.tiff`, `.ico`, `.qoi`.
+Anything else is passed over — including formats Pillow needs a plugin for, such as HEIC or AVIF.
 
 ## Known limitations
 
-- The similarity threshold is **fixed at 10 bits**; the toolbar shows it but there is no control to
-  change it yet. Two images that look alike but differ more than that will not be grouped.
+- **Anything the scan could not read is reported, not hidden.** Folders it could not list and images it
+  could not hash are counted at the end of the status bar (`3 folder(s) unreadable`), and hovering that
+  text lists the paths and the reason. If images you expect are missing, check there first.
+- The default similarity threshold of 10 bits is deliberately strict: it matches re-saved copies and rapid
+  bursts, but not shots of the same scene taken seconds apart, which typically land 12–18 bits apart. Raise
+  it in the toolbar to catch those — but the further you raise it, the more unrelated look-alikes it will
+  group. It is remembered between runs.
+- **Actual size** shows a photo at up to **4096 px** on its longest side — 1:1 on any screen, but a
+  downscaled copy for anything larger, such as a 200 MP photo. The caption says when it has scaled, so it is
+  not a pixel-peeping tool for images beyond that.
 - Deletion always goes to the recycle bin. There is no permanent-delete option, and files on network
   or removable drives without a recycle bin cannot be moved (the app reports which ones failed).
 - Ticking is disabled while a scan is running: the preview is a flat list of everything found so far,

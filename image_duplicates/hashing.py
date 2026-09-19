@@ -20,11 +20,23 @@ from PIL import Image, ImageOps
 DCT_SIZE = 32
 HASH_SIZE = 8
 
+# Phone cameras comfortably beat Pillow's default guard: a 200 MP photo is
+# 199,756,800 pixels against a default ceiling of 89,478,485, so those files
+# were refused as suspected decompression bombs and dropped from the scan
+# without a word. These are images the user pointed us at, so the ceiling is
+# raised past any real camera - while still refusing something absurd.
+Image.MAX_IMAGE_PIXELS = 500_000_000
+
 _M2 = math.sqrt(2.0)
 
 
 def _open_image(path: str) -> Image.Image:
     image = Image.open(path)
+    # Ask the decoder for a small picture up front. For JPEG that makes libjpeg
+    # decode with scaled DCTs, so a 200 MP photo costs a few MB instead of
+    # ~600 MB, and it is quicker too. The hashes only ever look at a 32x32
+    # image, so nothing is lost. Other formats ignore this, as before.
+    image.draft("L", (DCT_SIZE, DCT_SIZE))
     image = ImageOps.exif_transpose(image)
     return image.convert("L")
 

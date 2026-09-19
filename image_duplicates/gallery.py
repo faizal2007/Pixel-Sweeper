@@ -35,6 +35,7 @@ from PyQt6.QtGui import (
     QColor,
     QFileSystemModel,
     QFontMetrics,
+    QGuiApplication,
     QKeySequence,
     QPainter,
     QPalette,
@@ -56,6 +57,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QScrollArea,
+    QSpinBox,
     QSplitter,
     QStyle,
     QStyleOptionViewItem,
@@ -69,11 +71,21 @@ from PyQt6.QtWidgets import (
 )
 
 from .hashing import hamming
-from .scanner import ImageRecord, ScanCancelled, ScanResult, scan_folder
+from .scanner import (
+    DEFAULT_THRESHOLD,
+    ImageRecord,
+    ScanCancelled,
+    ScanResult,
+    regroup,
+    scan_folder,
+)
 
 _DEFAULT_GROUP_ROLE = int(Qt.ItemDataRole.UserRole)
 
 _THUMB_PIXEL = 200
+# Full-size preview ceiling. 4096 covers any screen at 1:1 and keeps the pixmap
+# to ~50 MB, where a 200 MP photo at native size would be about 600 MB.
+_FULL_PIXEL = 4096
 _THUMB_CACHE: dict[str, QPixmap] = {}
 _THUMB_DISK_DIR: str | None = None
 
@@ -142,6 +154,10 @@ def _thumb_pixmap(path: str) -> QPixmap:
 def _build_pixmap(path: str, max_size: int) -> QPixmap:
     try:
         with Image.open(path) as image:
+            # Decode at roughly the size we are going to show, so a 200 MP photo
+            # does not have to be unpacked in full first. Ignored by formats
+            # that cannot do it, and it never scales anything up.
+            image.draft("RGB", (max_size, max_size))
             image = ImageOps.exif_transpose(image)
             if image.mode in ("P", "CMYK", "YCbCr", "I;16", "F"):
                 image = image.convert("RGBA" if "transparency" in image.info else "RGB")
@@ -157,7 +173,38 @@ def _build_pixmap(path: str, max_size: int) -> QPixmap:
 
 
 def _load_full_pixmap(path: str) -> QPixmap:
-    return _build_pixmap(path, 1600)
+    return _build_pixmap(path, _FULL_PIXEL)
+
+
+def _count(count: int, noun: str) -> str:
+    """'1 image', '18 images' - plural only when it should be."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _fit_to_screen(
+    width: int, height: int, available: QSize, margin: int = 48
+) -> QSize:
+    """A preferred window size, shrunk to what the screen actually has.
+
+    Widget sizes are in logical pixels, so a 1200x900 window on a 150% display
+    is 1800x1350 real pixels - taller than a 1280x800 desktop, which pushes the
+    bottom row of buttons off the screen. The margin leaves room for the title
+    bar and window frame, which live outside the client area.
+    """
+    return QSize(
+        max(480, min(width, available.width() - margin)),
+        max(360, min(height, available.height() - margin)),
+    )
+
+
+def _screen_limited(width: int, height: int, widget: QWidget | None = None) -> QSize:
+    """``_fit_to_screen`` against the screen ``widget`` is (or will be) on."""
+    screen = widget.screen() if widget is not None else None
+    if screen is None:
+        screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        return QSize(width, height)
+    return _fit_to_screen(width, height, screen.availableGeometry())
 
 
 def _hsize(value: int) -> str:
@@ -761,19 +808,22 @@ class ImageViewer(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Image viewer")
-        self.resize(960, 720)
         self._records = records
         self._index = max(0, min(start, len(records) - 1))
         self._records_on_show = False
+        # Fitted by default: opening a 4000 px photo at 1:1 shows a corner of it,
+        # which says nothing about the picture as a whole.
+        self._actual_size = False
+        self._source = QPixmap()
 
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumSize(200, 200)
+        self.image_label.setMinimumSize(120, 120)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        scroll.setWidget(self.image_label)
+        self.area = QScrollArea()
+        self.area.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.area.setWidget(self.image_label)
+        self._apply_fit_mode()
 
         self.info = QLabel()
         self.info.setWordWrap(True)
@@ -783,6 +833,14 @@ class ImageViewer(QDialog):
         next_button = QPushButton("Next >")
         prev_button.clicked.connect(self._previous)
         next_button.clicked.connect(self._next)
+
+        self.actual_button = QPushButton("Actual size")
+        self.actual_button.setCheckable(True)
+        self.actual_button.setToolTip(
+            "Show the picture at 1:1 with scroll bars, instead of fitted to the "
+            "window - useful for checking whether two photos really match."
+        )
+        self.actual_button.toggled.connect(self._set_actual_size)
 
         delete_button = QPushButton("Delete This Image")
         delete_button.setToolTip(
@@ -795,12 +853,13 @@ class ImageViewer(QDialog):
         buttons.addStretch(1)
         buttons.addWidget(prev_button)
         buttons.addWidget(next_button)
+        buttons.addWidget(self.actual_button)
         buttons.addStretch(1)
         # Kept apart from Prev/Next so it is not hit by accident.
         buttons.addWidget(delete_button)
 
         self.layout = QVBoxLayout(self)
-        self.layout.addWidget(scroll, 1)
+        self.layout.addWidget(self.area, 1)
         self.layout.addWidget(self.info)
         self.layout.addLayout(buttons)
 
@@ -808,8 +867,25 @@ class ImageViewer(QDialog):
         QShortcut(QKeySequence("Right"), self, activated=self._next)
         QShortcut(QKeySequence("Delete"), self, activated=self._delete_current)
 
+        self.resize(_screen_limited(1200, 900, self))
         self._records_on_show = True
         self._show_current()
+
+    def _apply_fit_mode(self) -> None:
+        """A resizable area centres a shrunk picture; a fixed one keeps it at its
+        own size and grows scroll bars rather than cropping."""
+        self.area.setWidgetResizable(not self._actual_size)
+
+    def _set_actual_size(self, actual: bool) -> None:
+        self._actual_size = actual
+        self._apply_fit_mode()
+        self._refresh()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        if not self._actual_size:
+            # Stay fitted to the window as it changes size.
+            self._refresh()
 
     def _delete_current(self) -> None:
         """Ask for the image on screen to be trashed, then close if it went.
@@ -824,22 +900,83 @@ class ImageViewer(QDialog):
         if not os.path.isfile(record.path):
             self.accept()
 
-    def _show_current(self) -> None:
-        self._records_on_show = False
+    def _centre_view(self) -> None:
+        """Open on the middle of a picture, rather than its top-left corner."""
+        for bar in (
+            self.area.horizontalScrollBar(),
+            self.area.verticalScrollBar(),
+        ):
+            bar.setValue((bar.minimum() + bar.maximum()) // 2)
+
+    def _refresh(self) -> None:
+        """Draw the source pixmap at whichever zoom is selected."""
+        if not self._records:
+            return
         record = self._records[self._index]
-        self.setWindowTitle(
-            f"{os.path.basename(record.path)} ({self._index + 1}/{len(self._records)})"
-        )
-        self.image_label.setPixmap(_load_full_pixmap(record.path))
+        source = self._source
+
+        if source.isNull():
+            self.image_label.setPixmap(source)
+            shown = "this image cannot be previewed"
+        else:
+            displayed = source
+            if not self._actual_size:
+                window = self.area.viewport().size()
+                if (
+                    source.width() > window.width()
+                    or source.height() > window.height()
+                ):
+                    displayed = source.scaled(
+                        window,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+            self.image_label.setPixmap(displayed)
+            if self._actual_size:
+                self.image_label.resize(displayed.size())
+
+            if (displayed.width(), displayed.height()) == (
+                record.width,
+                record.height,
+            ):
+                shown = "shown at full size"
+            elif self._actual_size:
+                shown = (
+                    f"shown at {displayed.width()} x {displayed.height()} "
+                    f"(of {record.width} x {record.height})"
+                )
+            else:
+                shown = (
+                    f"fitted to the window ({displayed.width()} x {displayed.height()})"
+                )
+
         anchor = self._records[0]
         similarity = hamming(anchor.phash, record.phash)
         self.info.setText(
             f"{self._index + 1} / {len(self._records)}\n"
             f"{record.path}\n"
             f"{record.width} x {record.height}   {_hsize(record.size)}   "
-            f"hash diff to first: {similarity} bits"
+            f"hash diff to first: {similarity} bits\n"
+            f"{shown}"
         )
+
+    def _after_layout(self) -> None:
+        """Fit against the real viewport size, once the dialog has been laid out."""
+        self._refresh()
+        self._centre_view()
+
+    def _show_current(self) -> None:
+        self._records_on_show = False
+        record = self._records[self._index]
+        self.setWindowTitle(
+            f"{os.path.basename(record.path)} ({self._index + 1}/{len(self._records)})"
+        )
+        self._source = _load_full_pixmap(record.path)
+        self._refresh()
         self._records_on_show = True
+        # The viewport size is only final after the layout has run, so fit again
+        # then - otherwise the first picture is scaled to a stale size.
+        QTimer.singleShot(0, self._after_layout)
 
     def _previous(self) -> None:
         self._index = (self._index - 1) % len(self._records)
@@ -1032,10 +1169,16 @@ class ScanThread(QThread):
     _BATCH_SIZE = 48
     _BATCH_SECONDS = 0.15
 
-    def __init__(self, folder: str, cache_dir: str | None = None):
+    def __init__(
+        self,
+        folder: str,
+        cache_dir: str | None = None,
+        threshold: int = DEFAULT_THRESHOLD,
+    ):
         super().__init__()
         self.folder = folder
         self.cache_dir = cache_dir
+        self.threshold = threshold
         self._cancel = threading.Event()
         self._batch: list[ImageRecord] = []
         self._last_flush = 0.0
@@ -1063,6 +1206,7 @@ class ScanThread(QThread):
         try:
             result = scan_folder(
                 self.folder,
+                threshold=self.threshold,
                 on_progress=self.progress.emit,
                 cache_dir=self.cache_dir,
                 should_cancel=self._cancel.is_set,
@@ -1096,9 +1240,23 @@ class MainWindow(QMainWindow):
         self._cancelling = False
         self.settings = QSettings("ImageDuplicates", "ImageDuplicateGallery")
         self.last_folder_key = "last_folder"
+        self.threshold_key = "threshold"
+        self.threshold = min(
+            32,
+            max(
+                0,
+                int(
+                    self.settings.value(
+                        self.threshold_key, DEFAULT_THRESHOLD, int
+                    )
+                ),
+            ),
+        )
 
         self.setWindowTitle("Image Duplicate Gallery")
-        self.resize(1280, 820)
+        # Big enough to work in, but never taller than the desktop: the status
+        # bar and the toolbar live at the edges.
+        self.resize(_screen_limited(1280, 820, self))
 
         toolbar = QToolBar("Main")
         self.addToolBar(toolbar)
@@ -1108,7 +1266,18 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         self.threshold_label = QLabel(" Similarity threshold: ")
         toolbar.addWidget(self.threshold_label)
-        toolbar.addAction("10 bits").setEnabled(False)
+        self.threshold_spin = QSpinBox()
+        self.threshold_spin.setRange(0, 32)
+        self.threshold_spin.setSuffix(" bits")
+        self.threshold_spin.setValue(self.threshold)
+        self.threshold_spin.setToolTip(
+            "How far apart two hashes may be and still count as duplicates.\n"
+            "Higher finds more look-alikes, at the risk of grouping images that\n"
+            "only resemble each other; lower is stricter.\n\n"
+            "Changing it re-groups what has already been scanned, instantly."
+        )
+        self.threshold_spin.valueChanged.connect(self._apply_threshold)
+        toolbar.addWidget(self.threshold_spin)
         self.progress_bar = _ToolbarProgress(toolbar, self.cancel_scan)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1171,6 +1340,7 @@ class MainWindow(QMainWindow):
         self.current_folder = folder
         self.tree.clear()
         self.tree.setEnabled(False)
+        self.threshold_spin.setEnabled(False)  # applies to the next scan
         self.gallery.begin_live(f"Scanning {folder}")
         self.counts_label.setText("Scanning...")
         self.status.showMessage(f"Scanning {folder}...")
@@ -1182,7 +1352,7 @@ class MainWindow(QMainWindow):
         )
         if cache_root:
             cache_dir = os.path.join(cache_root, "index")
-        self.thread = ScanThread(folder, cache_dir)
+        self.thread = ScanThread(folder, cache_dir, self.threshold)
         self.thread.progress.connect(self._on_progress)
         self.thread.records_found.connect(self._on_records_found)
         self.thread.scan_done.connect(self._on_scan_done)
@@ -1212,6 +1382,25 @@ class MainWindow(QMainWindow):
             else "Cancelling scan..."
         )
 
+    def _apply_threshold(self, value: int) -> None:
+        """Re-group at a new threshold. Nothing is re-read or re-hashed."""
+        self.threshold = value
+        self.settings.setValue(self.threshold_key, value)
+        if self.result is None:
+            self.status.showMessage(f"Similarity threshold set to {value} bits.")
+            return
+
+        started = time.monotonic()
+        self.result = regroup(self.result, value)
+        self.tree.clear()  # _display_result adds to the tree, it does not replace it
+        self._display_result(self.result)
+        elapsed = (time.monotonic() - started) * 1000
+        self.status.showMessage(
+            f"Regrouped at {value} bits in {elapsed:.0f} ms - "
+            f"{_count(len(self.result.groups), 'duplicate group')}, "
+            f"{_count(len(self.result.uniques), 'unique image')}."
+        )
+
     def _on_progress(self, done: int, total: int, path: str) -> None:
         if self._cancelling:
             # Late updates must not bring the progress bar back after a cancel.
@@ -1226,6 +1415,7 @@ class MainWindow(QMainWindow):
 
     def _on_scan_failed(self, message: str) -> None:
         self.tree.setEnabled(True)
+        self.threshold_spin.setEnabled(True)
         self.progress_bar.finish()
         self.status.showMessage("Scan failed.")
         QMessageBox.critical(self, "Scan failed", message)
@@ -1238,6 +1428,7 @@ class MainWindow(QMainWindow):
         self.result = result
         self.result_folder = self.current_folder
         self.tree.setEnabled(True)
+        self.threshold_spin.setEnabled(True)
         self.progress_bar.finish()
         self._populate_tree(result)
         if self.gallery.is_live():
@@ -1245,10 +1436,14 @@ class MainWindow(QMainWindow):
             # streaming preview has to be dismissed by hand.
             self.gallery.set_records([], "No images found in this folder.")
         self._update_counts(result)
+        notice = self._scan_notice(result)
+        if notice:
+            self.status.showMessage(f"{self.current_folder or ''}  -  {notice}")
+        else:
+            self.status.showMessage(self.current_folder or "")
 
     def _on_scan_done(self, result: ScanResult) -> None:
         self._display_result(result)
-        self.status.showMessage(self.current_folder or "")
         next_folder, self.pending_folder = self.pending_folder, None
         if next_folder:
             self.start_scan(next_folder)
@@ -1279,6 +1474,7 @@ class MainWindow(QMainWindow):
         self.settings.remove(self.last_folder_key)
         self.tree.clear()
         self.tree.setEnabled(True)
+        self.threshold_spin.setEnabled(True)
         self.gallery.show_raw_folder()
         self.counts_label.setText("No images scanned")
         self.status.showMessage(f"Cancelled scanning {folder}.")
@@ -1339,11 +1535,41 @@ class MainWindow(QMainWindow):
 
     def _update_counts(self, result: ScanResult) -> None:
         wasted = _hsize(result.wasted_bytes)
-        self.counts_label.setText(
+        text = (
             f"{result.total} images  |  {len(result.groups)} duplicate groups "
             f"({result.duplicated_count} images)  |  {len(result.uniques)} unique  "
             f"|  {wasted} wasted"
         )
+
+        # Without this a folder that cannot be read just looks like an empty or
+        # half-scanned one, with no hint as to why images are missing.
+        problems: list[str] = []
+        details: list[str] = []
+        if result.skipped_dirs:
+            problems.append(f"{len(result.skipped_dirs)} folder(s) unreadable")
+            details.append("Folders that could not be read:")
+            details += [
+                f"  {path}  ({reason})" for path, reason in result.skipped_dirs[:20]
+            ]
+        if result.failed:
+            problems.append(f"{len(result.failed)} image(s) failed")
+            details.append("Images that could not be hashed:")
+            details += [f"  {path}  ({reason})" for path, reason in result.failed[:20]]
+        if problems:
+            text += "  |  " + ", ".join(problems)
+
+        self.counts_label.setText(text)
+        self.counts_label.setToolTip("\n".join(details))
+
+    @staticmethod
+    def _scan_notice(result: ScanResult) -> str:
+        """A short note about anything the scan could not read."""
+        parts: list[str] = []
+        if result.skipped_dirs:
+            parts.append(f"{len(result.skipped_dirs)} folder(s) could not be read")
+        if result.failed:
+            parts.append(f"{len(result.failed)} image(s) could not be hashed")
+        return " and ".join(parts)
 
     def _populate_tree(self, result: ScanResult) -> None:
         self.tree.blockSignals(True)
@@ -1360,7 +1586,7 @@ class MainWindow(QMainWindow):
                         groups_root,
                         [
                             f"Group {index}  ({len(group)} images, {wasted} wasted) "
-                            f"- {os.path.basename(first.path)}"
+                            f"- {self._relative(first.path)}"
                         ],
                     )
                     item.setData(0, _DEFAULT_GROUP_ROLE, list(group))
@@ -1374,6 +1600,7 @@ class MainWindow(QMainWindow):
                 self.tree, [f"Unique Images ({len(result.uniques)})"]
             )
             self._insert_unique_summary(uniques_root, result.uniques)
+            self._insert_folder_summary(result)
         finally:
             self.tree.blockSignals(False)
 
@@ -1388,6 +1615,45 @@ class MainWindow(QMainWindow):
     ) -> None:
         summary = QTreeWidgetItem(root, ["Click to browse all unique images"])
         summary.setData(0, _DEFAULT_GROUP_ROLE, list(uniques))
+
+    def _relative(self, path: str) -> str:
+        """A path as the user thinks of it: relative to the scanned folder."""
+        if not self.current_folder:
+            return os.path.basename(path)
+        try:
+            return os.path.relpath(path, self.current_folder)
+        except ValueError:  # different drive
+            return os.path.basename(path)
+
+    def _folder_of(self, path: str) -> str:
+        return os.path.dirname(self._relative(path))
+
+    def _all_records(self, result: ScanResult) -> list[ImageRecord]:
+        return [record for group in result.groups for record in group] + list(
+            result.uniques
+        )
+
+    def _insert_folder_summary(self, result: ScanResult) -> None:
+        """One node per folder that contributed images, with its count.
+
+        Nothing else in the window names a folder: the gallery shows one flat
+        grid, and group headings used to show only a file name. Without this
+        there is no way to tell that a given subfolder was scanned at all.
+        """
+        by_folder: dict[str, list[ImageRecord]] = {}
+        for record in self._all_records(result):
+            # dirname() of a file sitting directly in the root is "", not ".".
+            folder = self._folder_of(record.path) or "."
+            by_folder.setdefault(folder, []).append(record)
+
+        root = QTreeWidgetItem(self.tree, [f"Scanned Folders ({len(by_folder)})"])
+        for folder in sorted(by_folder, key=lambda name: (name != ".", name.lower())):
+            records = sorted(by_folder[folder], key=lambda r: r.path.lower())
+            label = "(top level)" if folder == "." else folder
+            item = QTreeWidgetItem(
+                root, [f"{label}  ({_count(len(records), 'image')})"]
+            )
+            item.setData(0, _DEFAULT_GROUP_ROLE, records)
 
     def _on_tree_change(self, current: QTreeWidgetItem | None, _previous) -> None:
         if current is None:

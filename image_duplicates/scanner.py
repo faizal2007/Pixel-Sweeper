@@ -1,5 +1,8 @@
 """Walk an image library, hash every image and group near-duplicates.
 
+The walk is recursive and covers the whole tree at any depth, following folder
+links (with cycle protection) and reporting folders it could not read.
+
 Grouping strategy:
 
 1. Every image is hashed (pHash + dHash) in a thread pool.
@@ -55,6 +58,9 @@ class ScanResult:
     uniques: list[ImageRecord]
     failed: list[tuple[str, str]]
     threshold: int
+    # Folders that could not be listed at all, and why. Surfaced in the UI so a
+    # missing subfolder is visible instead of being silently ignored.
+    skipped_dirs: tuple[tuple[str, str], ...] = ()
 
     @property
     def total(self) -> int:
@@ -69,21 +75,64 @@ class ScanResult:
         return sum((len(g) - 1) * max(r.size for r in g) for g in self.groups)
 
 
-def _find_images(root: str) -> list[str]:
+def _walk_images(root: str, skipped: list[tuple[str, str]]) -> list[str]:
+    """Every image below ``root``, at any depth.
+
+    ``os.walk`` is used with ``onerror`` so a folder that cannot be listed is
+    recorded rather than dropped in silence, and with ``followlinks=True`` so
+    folders reached through a symlink are scanned too - some libraries keep a
+    subfolder behind one. A set of real paths keeps linked folders from being
+    walked twice or looping for ever.
+    """
+
+    def on_error(error: OSError) -> None:
+        skipped.append((getattr(error, "filename", None) or root, str(error)))
+
     paths: list[str] = []
-    for dirpath, _dirnames, filenames in os.walk(root):
+    visited = {os.path.realpath(root)}
+    for dirpath, dirnames, filenames in os.walk(
+        root, onerror=on_error, followlinks=True
+    ):
+        # Prune in place so a link back up the tree cannot recurse for ever.
+        keep: list[str] = []
+        for name in dirnames:
+            real = os.path.realpath(os.path.join(dirpath, name))
+            if real in visited:
+                continue
+            visited.add(real)
+            keep.append(name)
+        dirnames[:] = keep
+
         for name in filenames:
             if os.path.splitext(name)[1].lower() in IMAGE_EXTS:
                 paths.append(os.path.join(dirpath, name))
     return paths
 
 
-def _hash_one(path: str) -> ImageRecord:
-    from PIL import Image, ImageOps
+def _display_size(path: str) -> tuple[int, int]:
+    """The size the image is meant to be shown at, without decoding it.
+
+    The dimensions come from the header, swapped when the EXIF orientation says
+    the picture is stored on its side. ``exif_transpose`` would give the same
+    answer but has to decode the whole image first - for a 200 MP photo that is
+    ~600 MB of pixels just to learn two numbers.
+    """
+    from PIL import ExifTags, Image
 
     with Image.open(path) as image:
-        image = ImageOps.exif_transpose(image)
         width, height = image.size
+        try:
+            orientation = image.getexif().get(ExifTags.Base.Orientation, 1)
+        except Exception:  # noqa: BLE001 - malformed EXIF is not worth failing over
+            orientation = 1
+    if orientation in (5, 6, 7, 8):
+        # Those orientations store the picture rotated a quarter turn.
+        width, height = height, width
+    return width, height
+
+
+def _hash_one(path: str) -> ImageRecord:
+    width, height = _display_size(path)
     size = os.path.getsize(path)
     phash = perceptual_hash(path)
     dhash = difference_hash(path)
@@ -183,6 +232,10 @@ def scan_folder(
 ) -> ScanResult:
     """Hash every image under ``root`` and return grouped duplicates.
 
+    The whole tree is scanned, at any depth, including folders reached through
+    a symlink or junction. Folders that cannot be listed are collected into
+    ``ScanResult.skipped_dirs`` rather than being passed over in silence.
+
     When ``cache_dir`` is given, the persisted per-folder index is consulted
     first: images whose (size, mtime_ns) still match their cached entry are
     reused without re-opening/re-hashing, and the refreshed index is written
@@ -202,7 +255,8 @@ def scan_folder(
     def cancelled() -> bool:
         return should_cancel is not None and should_cancel()
 
-    paths = _find_images(root)
+    skipped: list[tuple[str, str]] = []
+    paths = _walk_images(root, skipped)
     total = len(paths)
     if on_progress:
         on_progress(0, total, "")
@@ -299,13 +353,33 @@ def scan_folder(
         # only has to do the rest.
         raise ScanCancelled(f"Cancelled while hashing {root}")
 
+    return _build_result(records, failed, skipped, threshold)
+
+
+def _build_result(
+    records: list[ImageRecord],
+    failed: list[tuple[str, str]],
+    skipped: list[tuple[str, str]],
+    threshold: int,
+) -> ScanResult:
     groups, uniques = _group_records(records, threshold)
     groups.sort(key=lambda g: (-len(g), g[0].path.lower()))
     uniques.sort(key=lambda r: (r.phash, r.path.lower()))
     for group in groups:
         group.sort(key=lambda r: (r.phash, r.path.lower()))
+    return ScanResult(groups, uniques, failed, threshold, tuple(skipped))
 
-    return ScanResult(groups, uniques, failed, threshold)
+
+def regroup(result: ScanResult, threshold: int) -> ScanResult:
+    """Re-group an existing result at a different threshold.
+
+    Every hash is already known, so nothing is re-read or re-hashed and this is
+    instant even on a large library. That is what makes the threshold a live
+    control rather than something you have to re-scan for.
+    """
+    records = [record for group in result.groups for record in group]
+    records += list(result.uniques)
+    return _build_result(records, result.failed, list(result.skipped_dirs), threshold)
 
 
 def _group_records(
