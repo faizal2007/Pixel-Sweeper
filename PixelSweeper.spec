@@ -5,12 +5,17 @@ Build (from the project root, with the venv active):
 
     pyinstaller --clean --noconfirm PixelSweeper.spec
 
-The result is a single windowed executable in ``dist/PixelSweeper.exe``.
+The result is a single windowed executable in ``dist/PixelSweeper.exe``, carrying
+the icon from ``assets/pixelsweeper.ico`` (rebuild that with
+``python assets/make_icon.py`` if the artwork changes).
 """
 
 import os
 
 ENTRY = os.path.join(SPECPATH, "main.py")
+# Ships inside the bundle too, so the window icon can be set when the app runs
+# frozen; the EXE icon below is what Explorer and the taskbar use for the file.
+ICON = os.path.join(SPECPATH, "assets", "pixelsweeper.ico")
 
 # PyQt6 ships far more than a widgets-only app needs. Dropping the unused
 # bindings keeps the executable to roughly half the size, and none of them are
@@ -58,7 +63,7 @@ a = Analysis(
     [ENTRY],
     pathex=[SPECPATH],
     binaries=[],
-    datas=[],
+    datas=[(ICON, "assets")] if os.path.isfile(ICON) else [],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -77,6 +82,7 @@ exe = EXE(
     a.datas,
     [],
     name="PixelSweeper",
+    icon=ICON if os.path.isfile(ICON) else None,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

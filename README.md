@@ -1,3 +1,5 @@
+<img src="assets/pixelsweeper-256.png" width="96" alt="Pixel Sweeper icon: two photo tiles with a red removal badge">
+
 # Pixel Sweeper
 
 Finds near-duplicate images in a folder and lets you clean them up in a visual gallery — tick the
@@ -60,7 +62,10 @@ pyinstaller --clean --noconfirm PixelSweeper.spec
 ```
 
 That produces a single-file, windowed `dist\PixelSweeper.exe` (about 42 MB). `PixelSweeper.spec`
-excludes the large PyQt6 bindings the app never touches, which is what keeps the size down.
+excludes the large PyQt6 bindings the app never touches, which is what keeps the size down. It also
+embeds `assets\pixelsweeper.ico` into the executable and bundles it as a data file, so the icon
+appears in Explorer, the taskbar and the window title bar (and the source run picks up the same file
+from `assets\`).
 
 > **Note:** a one-file executable runs as a parent + child process pair. If a copy is still running,
 > the next build fails with `PermissionError: [WinError 5]`. Close the app (check Task Manager for
@@ -79,7 +84,7 @@ flowchart LR
 1. **Every image is hashed twice** — a DCT-based pHash (32×32 greyscale, low-frequency 8×8 block,
    median threshold) and a cheap horizontal dHash. Both are 64-bit values.
 2. **Images sharing an exact pHash** form a bucket.
-3. **Buckets are merged** when their hashes are within the **similarity threshold** — 10 bits by default, adjusting in the toolbar. A BK-tree keeps that pairwise search fast on large libraries. Because every hash is already known, changing the threshold re-groups instantly without re-reading a single file.
+3. **Buckets are merged** when their hashes are within the **similarity threshold**, fixed at **10 bits**. A BK-tree keeps that pairwise search fast on large libraries.
 4. **Buckets with two or more images** become duplicate groups; the rest are the unique set.
 
 The walk covers the whole tree at any depth. Folder links (symlinks and junctions) are followed, so a
@@ -115,7 +120,7 @@ can tell at a glance which folders a scan covered.
 | Action | How |
 | --- | --- |
 | Browse everything one folder contributed | **Scanned Folders** in the tree lists every folder that produced an image, with its count |
-| Change how alike two images must be | **Similarity threshold** in the toolbar, 0–32 bits |
+| See how alike two images must be | The toolbar shows the **similarity threshold**, fixed at 10 bits |
 | Tick / untick an image | Click the box in the caption row under the thumbnail |
 | Tick everything | **Check All** |
 | Clear all ticks | **Uncheck All** |
@@ -162,6 +167,12 @@ Because the two names differ, the executable and a development run keep separate
 ```
 main.py                     # entry point: python main.py [folder]
 PixelSweeper.spec           # PyInstaller build definition
+assets/
+    pixelsweeper.svg        # icon artwork, full detail (used from 32 px up)
+    pixelsweeper-small.svg  # icon artwork, simplified (used below 32 px)
+    make_icon.py            # renders both to a multi-size .ico and a .png
+    pixelsweeper.ico        # the icon the app and the executable use
+    pixelsweeper-256.png    # preview copy of the icon
 image_duplicates/
     gallery.py              # PyQt6 window, gallery view, scan thread
     scanner.py              # folder walk, hash index cache, duplicate grouping
@@ -170,6 +181,15 @@ image_duplicates/
 pyproject.toml              # project metadata, dependencies, dev extra
 uv.lock                     # pinned dependency lock file
 ```
+
+The icon is generated, not hand-drawn per size — edit the SVG and rebuild it:
+
+```powershell
+.venv\Scripts\python.exe assets\make_icon.py
+```
+
+That writes every size from 16 to 256 px as a native render, switches to the simplified artwork
+below 32 px so it stays readable at small sizes, and updates `pixelsweeper.ico` plus the 256 px PNG.
 
 ## Development notes
 
@@ -198,10 +218,11 @@ Anything else is passed over — including formats Pillow needs a plugin for, su
 - **Anything the scan could not read is reported, not hidden.** Folders it could not list and images it
   could not hash are counted at the end of the status bar (`3 folder(s) unreadable`), and hovering that
   text lists the paths and the reason. If images you expect are missing, check there first.
-- The default similarity threshold of 10 bits is deliberately strict: it matches re-saved copies and rapid
-  bursts, but not shots of the same scene taken seconds apart, which typically land 12–18 bits apart. Raise
-  it in the toolbar to catch those — but the further you raise it, the more unrelated look-alikes it will
-  group. It is remembered between runs.
+- The similarity threshold is deliberately strict at 10 bits: it matches re-saved copies and rapid bursts,
+  but not shots of the same scene taken seconds apart, which typically land 12–18 bits apart. Two images
+  that look alike to you but land 11+ bits apart are reported as unique rather than grouped, and the
+  toolbar shows the fixed value so it is never a surprise. Changing it means changing
+  `DEFAULT_THRESHOLD` in `image_duplicates/scanner.py` and re-scanning.
 - **Actual size** shows a photo at up to **4096 px** on its longest side — 1:1 on any screen, but a
   downscaled copy for anything larger, such as a 200 MP photo. The caption says when it has scaled, so it is
   not a pixel-peeping tool for images beyond that.

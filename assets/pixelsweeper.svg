@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Pixel Sweeper: two photos, the one in front marked for removal.
+       Full-detail artwork, used from 32 px upwards. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b7de9"/>
+      <stop offset="1" stop-color="#1256b4"/>
+    </linearGradient>
+    <clipPath id="round">
+      <rect x="0" y="0" width="256" height="256" rx="58" ry="58"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#round)">
+    <rect x="0" y="0" width="256" height="256" fill="url(#tile)"/>
+    <!-- the copy, behind -->
+    <rect x="36" y="32" width="110" height="110" rx="20" ry="20" fill="#ffffff" fill-opacity="0.42"/>
+    <!-- the one being kept -->
+    <rect x="88" y="80" width="110" height="110" rx="20" ry="20" fill="#ffffff"/>
+    <g fill="#1a73e8">
+      <path d="M100 178 L134 126 L164 172 Z"/>
+      <circle cx="168" cy="112" r="12"/>
+    </g>
+    <!-- remove it -->
+    <circle cx="184" cy="182" r="42" fill="#db4437" stroke="#ffffff" stroke-width="8"/>
+    <rect x="163" y="175" width="42" height="14" rx="7" ry="7" fill="#ffffff"/>
+  </g>
+</svg>

@@ -36,6 +36,7 @@ from PyQt6.QtGui import (
     QFileSystemModel,
     QFontMetrics,
     QGuiApplication,
+    QIcon,
     QKeySequence,
     QPainter,
     QPalette,
@@ -57,7 +58,6 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QScrollArea,
-    QSpinBox,
     QSplitter,
     QStyle,
     QStyleOptionViewItem,
@@ -76,7 +76,6 @@ from .scanner import (
     ImageRecord,
     ScanCancelled,
     ScanResult,
-    regroup,
     scan_folder,
 )
 
@@ -1240,20 +1239,12 @@ class MainWindow(QMainWindow):
         self._cancelling = False
         self.settings = QSettings("ImageDuplicates", "ImageDuplicateGallery")
         self.last_folder_key = "last_folder"
-        self.threshold_key = "threshold"
-        self.threshold = min(
-            32,
-            max(
-                0,
-                int(
-                    self.settings.value(
-                        self.threshold_key, DEFAULT_THRESHOLD, int
-                    )
-                ),
-            ),
-        )
+        # Fixed, not user-adjustable: 10 bits is the value that reliably catches
+        # re-saved and resized copies without pairing photos that merely look
+        # similar. Exposed here so the one place to change it is obvious.
+        self.threshold = DEFAULT_THRESHOLD
 
-        self.setWindowTitle("Image Duplicate Gallery")
+        self.setWindowTitle("Pixel Sweeper")
         # Big enough to work in, but never taller than the desktop: the status
         # bar and the toolbar live at the edges.
         self.resize(_screen_limited(1280, 820, self))
@@ -1264,20 +1255,14 @@ class MainWindow(QMainWindow):
         open_action.setShortcut(QKeySequence("Ctrl+O"))
         open_action.triggered.connect(self.choose_folder)
         toolbar.addSeparator()
-        self.threshold_label = QLabel(" Similarity threshold: ")
-        toolbar.addWidget(self.threshold_label)
-        self.threshold_spin = QSpinBox()
-        self.threshold_spin.setRange(0, 32)
-        self.threshold_spin.setSuffix(" bits")
-        self.threshold_spin.setValue(self.threshold)
-        self.threshold_spin.setToolTip(
+        self.threshold_label = QLabel(f" Similarity threshold: {self.threshold} bits ")
+        self.threshold_label.setToolTip(
             "How far apart two hashes may be and still count as duplicates.\n"
-            "Higher finds more look-alikes, at the risk of grouping images that\n"
-            "only resemble each other; lower is stricter.\n\n"
-            "Changing it re-groups what has already been scanned, instantly."
+            "This is fixed at "
+            f"{self.threshold} bits: strict enough to catch re-saved, resized\n"
+            "and recompressed copies, without pairing photos that only look alike."
         )
-        self.threshold_spin.valueChanged.connect(self._apply_threshold)
-        toolbar.addWidget(self.threshold_spin)
+        toolbar.addWidget(self.threshold_label)
         self.progress_bar = _ToolbarProgress(toolbar, self.cancel_scan)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1340,7 +1325,6 @@ class MainWindow(QMainWindow):
         self.current_folder = folder
         self.tree.clear()
         self.tree.setEnabled(False)
-        self.threshold_spin.setEnabled(False)  # applies to the next scan
         self.gallery.begin_live(f"Scanning {folder}")
         self.counts_label.setText("Scanning...")
         self.status.showMessage(f"Scanning {folder}...")
@@ -1382,25 +1366,6 @@ class MainWindow(QMainWindow):
             else "Cancelling scan..."
         )
 
-    def _apply_threshold(self, value: int) -> None:
-        """Re-group at a new threshold. Nothing is re-read or re-hashed."""
-        self.threshold = value
-        self.settings.setValue(self.threshold_key, value)
-        if self.result is None:
-            self.status.showMessage(f"Similarity threshold set to {value} bits.")
-            return
-
-        started = time.monotonic()
-        self.result = regroup(self.result, value)
-        self.tree.clear()  # _display_result adds to the tree, it does not replace it
-        self._display_result(self.result)
-        elapsed = (time.monotonic() - started) * 1000
-        self.status.showMessage(
-            f"Regrouped at {value} bits in {elapsed:.0f} ms - "
-            f"{_count(len(self.result.groups), 'duplicate group')}, "
-            f"{_count(len(self.result.uniques), 'unique image')}."
-        )
-
     def _on_progress(self, done: int, total: int, path: str) -> None:
         if self._cancelling:
             # Late updates must not bring the progress bar back after a cancel.
@@ -1415,7 +1380,6 @@ class MainWindow(QMainWindow):
 
     def _on_scan_failed(self, message: str) -> None:
         self.tree.setEnabled(True)
-        self.threshold_spin.setEnabled(True)
         self.progress_bar.finish()
         self.status.showMessage("Scan failed.")
         QMessageBox.critical(self, "Scan failed", message)
@@ -1428,7 +1392,6 @@ class MainWindow(QMainWindow):
         self.result = result
         self.result_folder = self.current_folder
         self.tree.setEnabled(True)
-        self.threshold_spin.setEnabled(True)
         self.progress_bar.finish()
         self._populate_tree(result)
         if self.gallery.is_live():
@@ -1474,7 +1437,6 @@ class MainWindow(QMainWindow):
         self.settings.remove(self.last_folder_key)
         self.tree.clear()
         self.tree.setEnabled(True)
-        self.threshold_spin.setEnabled(True)
         self.gallery.show_raw_folder()
         self.counts_label.setText("No images scanned")
         self.status.showMessage(f"Cancelled scanning {folder}.")
@@ -1727,8 +1689,32 @@ class _ToolbarProgress:
         self.cancel_button.setEnabled(False)
 
 
+def _asset_path(name: str) -> str:
+    """Where a bundled asset lives, from a checkout or inside the packaged exe.
+
+    PyInstaller unpacks ``datas`` next to the executable's temporary directory,
+    reachable as ``sys._MEIPASS``; from source the assets sit beside the package.
+    """
+    roots = []
+    frozen = getattr(sys, "_MEIPASS", "")
+    if frozen:
+        roots.append(frozen)
+    roots.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for root in roots:
+        candidate = os.path.join(root, "assets", name)
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
 def run_gui(initial_folder: str | None = None) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
+    # One call covers every window, the preview and the dialogs. The packaged
+    # exe also carries the icon in its own file, but that is not enough here:
+    # without this, Qt shows its default logo in the title bar and taskbar.
+    icon_path = _asset_path("pixelsweeper.ico")
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
     window = MainWindow(initial_folder)
     window.show()
     return app.exec()

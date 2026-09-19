@@ -370,18 +370,6 @@ def _build_result(
     return ScanResult(groups, uniques, failed, threshold, tuple(skipped))
 
 
-def regroup(result: ScanResult, threshold: int) -> ScanResult:
-    """Re-group an existing result at a different threshold.
-
-    Every hash is already known, so nothing is re-read or re-hashed and this is
-    instant even on a large library. That is what makes the threshold a live
-    control rather than something you have to re-scan for.
-    """
-    records = [record for group in result.groups for record in group]
-    records += list(result.uniques)
-    return _build_result(records, result.failed, list(result.skipped_dirs), threshold)
-
-
 def _group_records(
     records: list[ImageRecord], threshold: int
 ) -> tuple[list[list[ImageRecord]], list[ImageRecord]]:
