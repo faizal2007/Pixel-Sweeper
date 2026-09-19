@@ -10,6 +10,7 @@ import hashlib
 import os
 import sys
 import threading
+import time
 from io import BytesIO
 
 from PIL import Image, ImageOps
@@ -182,10 +183,22 @@ class ThumbnailModel(QAbstractListModel):
     def __init__(self, records: list[ImageRecord], parent: QWidget | None = None):
         super().__init__(parent)
         self.records = list(records)
+        # True while this model is the streamed preview shown during a scan,
+        # where images are still arriving and ticking would be thrown away.
+        self.live = False
         self._checked: set[str] = set()
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.records)
+
+    def add_records(self, records: list[ImageRecord]) -> None:
+        """Append streamed records instead of rebuilding the whole model."""
+        if not records:
+            return
+        first = len(self.records)
+        self.beginInsertRows(QModelIndex(), first, first + len(records) - 1)
+        self.records.extend(records)
+        self.endInsertRows()
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
         # Not ItemIsUserCheckable: the delegate alone paints the box and turns
@@ -315,6 +328,11 @@ def _checkbox_rect(item_rect: QRect) -> QRect:
     )
 
 
+def _is_live(index: QModelIndex) -> bool:
+    """True while a model is the streamed scan preview rather than a result."""
+    return bool(getattr(index.model(), "live", False))
+
+
 class ThumbnailDelegate(QStyledItemDelegate):
     """Draws exactly one tick box per tile, in a caption row under the image.
 
@@ -362,7 +380,11 @@ class ThumbnailDelegate(QStyledItemDelegate):
                 option.widget,
             )
 
-        checked = index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
+        live = _is_live(index)
+        checked = (
+            not live
+            and index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
+        )
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         area = _image_area(option.rect)
         strip = _caption_strip(option.rect)
@@ -392,10 +414,14 @@ class ThumbnailDelegate(QStyledItemDelegate):
             painter.drawRoundedRect(strip.adjusted(1, 1, -1, -1), 4, 4)
             painter.restore()
 
-        self._paint_box(painter, option, box, checked)
+        if not live:
+            self._paint_box(painter, option, box, checked)
 
         metrics = QFontMetrics(option.font)
-        text_left = box.right() + _STRIP_PAD
+        # With no tick box in the preview, the filename starts at the strip edge.
+        text_left = (
+            strip.left() + _STRIP_PAD if live else box.right() + _STRIP_PAD
+        )
         text_rect = QRect(
             text_left,
             strip.top(),
@@ -474,6 +500,10 @@ class ThumbnailDelegate(QStyledItemDelegate):
         ):
             return super().editorEvent(event, model, option, index)
 
+        if _is_live(index):
+            # Streaming preview: nothing is tickable until the scan is done.
+            return False
+
         if event.button() != Qt.MouseButton.LeftButton:
             return False
         if not _checkbox_rect(option.rect).contains(event.position().toPoint()):
@@ -522,15 +552,18 @@ class GalleryView(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.model: ThumbnailModel | None = None
+        self._live = False
+        self._live_heading = ""
 
         self.title = QLabel("Open a folder to start.")
         self.title.setWordWrap(True)
         self.title.setStyleSheet("font-weight: 700; padding: 4px;")
 
-        self.hint = QLabel(
+        self._idle_hint = (
             "Tick the images you want to remove - click the box in the corner of "
             "a thumbnail, or select some and press Space - then press Delete Checked."
         )
+        self.hint = QLabel(self._idle_hint)
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet("color: palette(mid); padding: 0 4px 2px 4px;")
 
@@ -592,6 +625,7 @@ class GalleryView(QWidget):
         self.set_records([], "Open a folder, or choose one in the toolbar.")
 
     def set_records(self, records: list[ImageRecord], heading: str) -> None:
+        self.end_live()
         previous = self.model
         self.model = ThumbnailModel(records, self)
         self.model.checked_changed.connect(self._on_checked_changed)
@@ -603,6 +637,65 @@ class GalleryView(QWidget):
             # instead of letting it pile up as an unused child widget.
             previous.deleteLater()
 
+    def begin_live(self, heading: str) -> None:
+        """Show images as they arrive, while the scan is still running.
+
+        The preview is deliberately read-only. What streams in is a flat list of
+        everything found so far, not the duplicate groups, so anything ticked
+        here would be silently discarded the moment the scan finishes.
+        """
+        self._live = True
+        self._live_heading = heading
+        previous, self.model = self.model, ThumbnailModel([], self)
+        self.model.live = True
+        self.model.checked_changed.connect(self._on_checked_changed)
+        self.list.setModel(self.model)
+        self.title.setText(f"{heading}  -  no images yet")
+        self.hint.setText(
+            "Thumbnails appear as they are scanned. Ticking is available once "
+            "the scan finishes."
+        )
+        self._set_action_buttons_enabled(False)
+        self._on_checked_changed()
+        if previous is not None:
+            previous.deleteLater()
+
+    def append_records(self, records: list[ImageRecord]) -> None:
+        """Add the next batch of images found by a running scan."""
+        if self.model is None or not self._live or not records:
+            return
+        self.model.add_records(records)
+        self.title.setText(
+            f"{self._live_heading}  -  {len(self.model.records)} images so far"
+        )
+
+    def end_live(self) -> None:
+        """Leave the streaming preview; the caller supplies the real records."""
+        if not self._live:
+            return
+        self._live = False
+        self.hint.setText(self._idle_hint)
+        self._set_action_buttons_enabled(True)
+        if self.model is not None:
+            self.model.live = False
+            self.list.viewport().update()
+
+    def is_live(self) -> bool:
+        return self._live
+
+    def record_count(self) -> int:
+        return len(self.model.records) if self.model is not None else 0
+
+    def _set_action_buttons_enabled(self, enabled: bool) -> None:
+        for button in (
+            self.check_all_button,
+            self.uncheck_all_button,
+            self.check_rest_button,
+        ):
+            button.setEnabled(enabled)
+        if not enabled:
+            self.delete_button.setEnabled(False)
+
     def _selected_rows(self) -> list[int]:
         selection = self.list.selectionModel()
         if selection is None:
@@ -610,7 +703,7 @@ class GalleryView(QWidget):
         return sorted(index.row() for index in selection.selectedIndexes())
 
     def _toggle_selected(self) -> None:
-        if self.model is not None:
+        if self.model is not None and not self._live:
             self.model.toggle_checked(self._selected_rows())
 
     def _check_every_image(self) -> None:
@@ -629,14 +722,16 @@ class GalleryView(QWidget):
         self.model.set_all_checked(True, list(range(1, len(self.model.records))))
 
     def _on_checked_changed(self) -> None:
-        count = self.model.checked_count() if self.model else 0
+        count = (
+            0 if self._live or self.model is None else self.model.checked_count()
+        )
         self.delete_button.setText(
             f"Delete Checked ({count})" if count else "Delete Checked"
         )
         self.delete_button.setEnabled(count > 0)
 
     def _delete_checked(self) -> None:
-        if self.model is None:
+        if self.model is None or self._live:
             return
         paths = self.model.checked_paths()
         if paths:
@@ -896,19 +991,43 @@ class FolderPickerDialog(QDialog):
 
 class ScanThread(QThread):
     progress = pyqtSignal(int, int, str)
+    records_found = pyqtSignal(list)
     scan_done = pyqtSignal(object)
     scan_failed = pyqtSignal(str)
     scan_cancelled = pyqtSignal(str)
+
+    # Records reach the GUI in batches: one signal per image would flood the
+    # event loop on a large library, and the first batch goes out at once so the
+    # gallery starts filling immediately.
+    _BATCH_SIZE = 48
+    _BATCH_SECONDS = 0.15
 
     def __init__(self, folder: str, cache_dir: str | None = None):
         super().__init__()
         self.folder = folder
         self.cache_dir = cache_dir
         self._cancel = threading.Event()
+        self._batch: list[ImageRecord] = []
+        self._last_flush = 0.0
 
     def cancel(self) -> None:
         """Ask the scan to stop early. Safe to call from the GUI thread."""
         self._cancel.set()
+
+    def _collect(self, record: ImageRecord) -> None:
+        """Called from the scanning thread for every image it identifies."""
+        self._batch.append(record)
+        if (
+            len(self._batch) >= self._BATCH_SIZE
+            or time.monotonic() - self._last_flush >= self._BATCH_SECONDS
+        ):
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._batch:
+            self.records_found.emit(self._batch)
+            self._batch = []
+        self._last_flush = time.monotonic()
 
     def run(self) -> None:
         try:
@@ -917,6 +1036,7 @@ class ScanThread(QThread):
                 on_progress=self.progress.emit,
                 cache_dir=self.cache_dir,
                 should_cancel=self._cancel.is_set,
+                on_record=self._collect,
             )
         except ScanCancelled:
             self.scan_cancelled.emit(self.folder)
@@ -929,6 +1049,7 @@ class ScanThread(QThread):
             # complete but the user asked to stop, so it must not be shown.
             self.scan_cancelled.emit(self.folder)
             return
+        self._flush()
         self.scan_done.emit(result)
 
 
@@ -1020,7 +1141,7 @@ class MainWindow(QMainWindow):
         self.current_folder = folder
         self.tree.clear()
         self.tree.setEnabled(False)
-        self.gallery.show_raw_folder()
+        self.gallery.begin_live(f"Scanning {folder}")
         self.counts_label.setText("Scanning...")
         self.status.showMessage(f"Scanning {folder}...")
         self.progress_bar.set_busy(folder)
@@ -1033,6 +1154,7 @@ class MainWindow(QMainWindow):
             cache_dir = os.path.join(cache_root, "index")
         self.thread = ScanThread(folder, cache_dir)
         self.thread.progress.connect(self._on_progress)
+        self.thread.records_found.connect(self._on_records_found)
         self.thread.scan_done.connect(self._on_scan_done)
         self.thread.scan_failed.connect(self._on_scan_failed)
         self.thread.scan_cancelled.connect(self._on_scan_cancelled)
@@ -1066,6 +1188,12 @@ class MainWindow(QMainWindow):
             return
         self.progress_bar.update(done, total, path)
 
+    def _on_records_found(self, records: list[ImageRecord]) -> None:
+        """Show images as the scan identifies them, rather than at the end."""
+        self.gallery.append_records(records)
+        found = self.gallery.record_count()
+        self.counts_label.setText(f"Scanning... {found} images found so far")
+
     def _on_scan_failed(self, message: str) -> None:
         self.tree.setEnabled(True)
         self.progress_bar.finish()
@@ -1082,6 +1210,10 @@ class MainWindow(QMainWindow):
         self.tree.setEnabled(True)
         self.progress_bar.finish()
         self._populate_tree(result)
+        if self.gallery.is_live():
+            # Nothing was selectable in the tree (an empty folder), so the
+            # streaming preview has to be dismissed by hand.
+            self.gallery.set_records([], "No images found in this folder.")
         self._update_counts(result)
 
     def _on_scan_done(self, result: ScanResult) -> None:

@@ -179,6 +179,7 @@ def scan_folder(
     on_progress: Callable[[int, int, str], None] | None = None,
     cache_dir: str | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    on_record: Callable[[ImageRecord], None] | None = None,
 ) -> ScanResult:
     """Hash every image under ``root`` and return grouped duplicates.
 
@@ -190,6 +191,10 @@ def scan_folder(
     ``should_cancel`` is polled while walking and hashing. As soon as it
     returns True the scan stops, the index cache is still written with the
     hashes gathered so far, and ``ScanCancelled`` is raised.
+
+    ``on_record`` is called from the scanning thread for every image as soon as
+    it is identified - cached images first, then hashed ones as the pool
+    finishes them - which lets a caller show results while the scan runs.
     """
     if not os.path.isdir(root):
         raise NotADirectoryError(f"Not a directory: {root}")
@@ -227,16 +232,17 @@ def scan_folder(
             and entry.size == st.st_size
             and entry.mtime_ns == st.st_mtime_ns
         ):
-            records.append(
-                ImageRecord(
-                    path,
-                    entry.phash,
-                    entry.dhash,
-                    entry.width,
-                    entry.height,
-                    entry.size,
-                )
+            record = ImageRecord(
+                path,
+                entry.phash,
+                entry.dhash,
+                entry.width,
+                entry.height,
+                entry.size,
             )
+            records.append(record)
+            if on_record is not None:
+                on_record(record)
         else:
             to_hash.append(path)
 
@@ -256,9 +262,13 @@ def scan_folder(
                 done += 1
                 path = futures[future]
                 try:
-                    records.append(future.result())
+                    record = future.result()
                 except Exception as exc:  # noqa: BLE001 - report and continue
                     failed.append((path, str(exc)))
+                else:
+                    records.append(record)
+                    if on_record is not None:
+                        on_record(record)
                 if on_progress and done % 8 == 0:
                     on_progress(done, total, path)
     if on_progress and not stopped_early:
@@ -301,6 +311,10 @@ def scan_folder(
 def _group_records(
     records: list[ImageRecord], threshold: int
 ) -> tuple[list[list[ImageRecord]], list[ImageRecord]]:
+    if not records:
+        # Nothing to group - an empty folder, or a scan cancelled before the
+        # first hash. The BK-tree below also needs at least one hash to exist.
+        return [], []
     buckets: dict[int, list[ImageRecord]] = defaultdict(list)
     for record in records:
         buckets.setdefault(record.phash, []).append(record)
