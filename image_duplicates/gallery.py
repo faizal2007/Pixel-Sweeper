@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import threading
 from io import BytesIO
 
 from PIL import Image, ImageOps
@@ -67,7 +68,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .hashing import hamming
-from .scanner import ImageRecord, ScanResult, scan_folder
+from .scanner import ImageRecord, ScanCancelled, ScanResult, scan_folder
 
 _DEFAULT_GROUP_ROLE = int(Qt.ItemDataRole.UserRole)
 
@@ -887,16 +888,27 @@ class FolderPickerDialog(QDialog):
             f"when it finishes:\n{folder}"
         )
 
+    def clear_queued(self) -> None:
+        """Undo ``notify_queued`` when the queued folder gets dropped."""
+        self._queued = False
+        self._update_label()
+
 
 class ScanThread(QThread):
     progress = pyqtSignal(int, int, str)
     scan_done = pyqtSignal(object)
     scan_failed = pyqtSignal(str)
+    scan_cancelled = pyqtSignal(str)
 
     def __init__(self, folder: str, cache_dir: str | None = None):
         super().__init__()
         self.folder = folder
         self.cache_dir = cache_dir
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        """Ask the scan to stop early. Safe to call from the GUI thread."""
+        self._cancel.set()
 
     def run(self) -> None:
         try:
@@ -904,10 +916,20 @@ class ScanThread(QThread):
                 self.folder,
                 on_progress=self.progress.emit,
                 cache_dir=self.cache_dir,
+                should_cancel=self._cancel.is_set,
             )
-            self.scan_done.emit(result)
+        except ScanCancelled:
+            self.scan_cancelled.emit(self.folder)
+            return
         except Exception as exc:  # noqa: BLE001 - surfaced to the GUI
             self.scan_failed.emit(str(exc))
+            return
+        if self._cancel.is_set():
+            # Cancelled during the grouping step, after hashing: the result is
+            # complete but the user asked to stop, so it must not be shown.
+            self.scan_cancelled.emit(self.folder)
+            return
+        self.scan_done.emit(result)
 
 
 class MainWindow(QMainWindow):
@@ -916,9 +938,11 @@ class MainWindow(QMainWindow):
     def __init__(self, initial_folder: str | None = None):
         super().__init__()
         self.result: ScanResult | None = None
+        self.result_folder: str | None = None
         self.thread: ScanThread | None = None
         self.current_folder: str | None = None
         self.pending_folder: str | None = None
+        self._cancelling = False
         self.settings = QSettings("ImageDuplicates", "ImageDuplicateGallery")
         self.last_folder_key = "last_folder"
 
@@ -934,7 +958,7 @@ class MainWindow(QMainWindow):
         self.threshold_label = QLabel(" Similarity threshold: ")
         toolbar.addWidget(self.threshold_label)
         toolbar.addAction("10 bits").setEnabled(False)
-        self.progress_bar = _ToolbarProgress(toolbar)
+        self.progress_bar = _ToolbarProgress(toolbar, self.cancel_scan)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.tree = QTreeWidget()
@@ -1011,26 +1035,91 @@ class MainWindow(QMainWindow):
         self.thread.progress.connect(self._on_progress)
         self.thread.scan_done.connect(self._on_scan_done)
         self.thread.scan_failed.connect(self._on_scan_failed)
+        self.thread.scan_cancelled.connect(self._on_scan_cancelled)
         self.thread.start()
 
+    def cancel_scan(self) -> None:
+        """Stop the running scan and drop whatever folder is queued behind it."""
+        dropped, self.pending_folder = self.pending_folder, None
+        self.folder_picker.clear_queued()
+
+        running = self.thread is not None and self.thread.isRunning()
+        if not running:
+            self.progress_bar.finish()
+            self.status.showMessage(
+                f"Dropped the queued folder: {dropped}" if dropped else "Nothing to cancel."
+            )
+            return
+
+        self._cancelling = True
+        self.thread.cancel()
+        self.progress_bar.set_cancelling()
+        self.status.showMessage(
+            f"Cancelling scan... (queued folder dropped: {dropped})"
+            if dropped
+            else "Cancelling scan..."
+        )
+
     def _on_progress(self, done: int, total: int, path: str) -> None:
+        if self._cancelling:
+            # Late updates must not bring the progress bar back after a cancel.
+            return
         self.progress_bar.update(done, total, path)
 
     def _on_scan_failed(self, message: str) -> None:
         self.tree.setEnabled(True)
+        self.progress_bar.finish()
         self.status.showMessage("Scan failed.")
         QMessageBox.critical(self, "Scan failed", message)
+        next_folder, self.pending_folder = self.pending_folder, None
+        if next_folder:
+            self.status.showMessage(f"Scan failed - moving on to {next_folder}.")
+            self.start_scan(next_folder)
 
-    def _on_scan_done(self, result: ScanResult) -> None:
+    def _display_result(self, result: ScanResult) -> None:
         self.result = result
+        self.result_folder = self.current_folder
         self.tree.setEnabled(True)
         self.progress_bar.finish()
         self._populate_tree(result)
-        self.status.showMessage(self.current_folder or "")
         self._update_counts(result)
+
+    def _on_scan_done(self, result: ScanResult) -> None:
+        self._display_result(result)
+        self.status.showMessage(self.current_folder or "")
         next_folder, self.pending_folder = self.pending_folder, None
         if next_folder:
             self.start_scan(next_folder)
+
+    def _on_scan_cancelled(self, folder: str) -> None:
+        """Put the window back in a usable state after a cancelled scan."""
+        self._cancelling = False
+        self.progress_bar.finish()
+
+        # The thread emits this from inside run(), so it is about to finish;
+        # waiting here means a scan started right after this cannot end up
+        # queued behind a thread that is still winding down.
+        thread, self.thread = self.thread, None
+        if thread is not None:
+            thread.wait(5000)
+            thread.deleteLater()
+
+        if self.result is not None and self.result_folder:
+            self.current_folder = self.result_folder
+            self.settings.setValue(self.last_folder_key, self.result_folder)
+            self._display_result(self.result)
+            self.status.showMessage(
+                f"Cancelled scanning {folder} - still showing {self.result_folder}."
+            )
+            return
+
+        self.current_folder = None
+        self.settings.remove(self.last_folder_key)
+        self.tree.clear()
+        self.tree.setEnabled(True)
+        self.gallery.show_raw_folder()
+        self.counts_label.setText("No images scanned")
+        self.status.showMessage(f"Cancelled scanning {folder}.")
 
     def move_checked_to_trash(self, paths: list[str]) -> None:
         """Move the images the user ticked to the recycle bin, then re-scan."""
@@ -1149,9 +1238,9 @@ class MainWindow(QMainWindow):
 
 
 class _ToolbarProgress:
-    """A clearly visible progress bar in the toolbar while scanning."""
+    """The toolbar progress bar, plus the Cancel button that goes with it."""
 
-    def __init__(self, toolbar: QToolBar):
+    def __init__(self, toolbar: QToolBar, on_cancel=None):
         self.bar = QProgressBar()
         self.bar.setFixedWidth(300)
         self.bar.setTextVisible(True)
@@ -1164,23 +1253,50 @@ class _ToolbarProgress:
         self._action = toolbar.addWidget(self.bar)
         self._action.setVisible(False)
 
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setToolTip(
+            "Stop the running scan and drop any folder queued behind it."
+        )
+        self.cancel_button.setEnabled(False)
+        self._cancel_action = toolbar.addWidget(self.cancel_button)
+        self._cancel_action.setVisible(False)
+        if on_cancel is not None:
+            self.cancel_button.clicked.connect(on_cancel)
+
+    def _show(self) -> None:
+        for action, widget in (
+            (self._action, self.bar),
+            (self._cancel_action, self.cancel_button),
+        ):
+            action.setVisible(True)
+            widget.setVisible(True)
+
     def set_busy(self, folder: str) -> None:
-        self._action.setVisible(True)
-        self.bar.setVisible(True)
+        self._show()
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setText("Cancel")
         self.bar.setRange(0, 0)
         self.bar.setFormat(f"Scanning {os.path.basename(folder)}...")
 
     def update(self, done: int, total: int, path: str) -> None:
-        self._action.setVisible(True)
-        self.bar.setVisible(True)
+        self._show()
         self.bar.setRange(0, max(1, total))
         self.bar.setValue(done)
         name = os.path.basename(path) if path else ""
         self.bar.setFormat(f"{done} / {total}  ({int(done * 100 / max(1, total))}%)  {name}")
 
+    def set_cancelling(self) -> None:
+        """Show that the cancel request was accepted, and stop repeat clicks."""
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setText("Cancelling...")
+
     def finish(self) -> None:
         self._action.setVisible(False)
         self.bar.setVisible(False)
+        self._cancel_action.setVisible(False)
+        self.cancel_button.setVisible(False)
+        self.cancel_button.setText("Cancel")
+        self.cancel_button.setEnabled(False)
 
 
 def run_gui(initial_folder: str | None = None) -> int:

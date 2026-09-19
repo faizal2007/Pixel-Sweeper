@@ -31,6 +31,14 @@ IMAGE_EXTS = {
 DEFAULT_THRESHOLD = 10
 
 
+class ScanCancelled(Exception):
+    """Raised when ``should_cancel`` asks a running scan to stop.
+
+    Anything already hashed is left in the index cache, so a later scan of the
+    same folder picks up where this one stopped.
+    """
+
+
 @dataclass(frozen=True)
 class ImageRecord:
     path: str
@@ -170,6 +178,7 @@ def scan_folder(
     workers: int | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
     cache_dir: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> ScanResult:
     """Hash every image under ``root`` and return grouped duplicates.
 
@@ -177,9 +186,16 @@ def scan_folder(
     first: images whose (size, mtime_ns) still match their cached entry are
     reused without re-opening/re-hashing, and the refreshed index is written
     back so repeated scans of an unchanged folder avoid re-hashing everything.
+
+    ``should_cancel`` is polled while walking and hashing. As soon as it
+    returns True the scan stops, the index cache is still written with the
+    hashes gathered so far, and ``ScanCancelled`` is raised.
     """
     if not os.path.isdir(root):
         raise NotADirectoryError(f"Not a directory: {root}")
+
+    def cancelled() -> bool:
+        return should_cancel is not None and should_cancel()
 
     paths = _find_images(root)
     total = len(paths)
@@ -193,7 +209,11 @@ def scan_folder(
     to_hash: list[str] = []
     stat_cache: dict[str, tuple[int, int]] = {}  # path -> (size, mtime_ns)
 
-    for path in paths:
+    for position, path in enumerate(paths):
+        # Cheap enough to poll often: no images have been opened yet, so a
+        # cancel here can stop before any real work happens.
+        if position % 256 == 0 and cancelled():
+            raise ScanCancelled(f"Cancelled before hashing {root}")
         rel = os.path.relpath(path, root)
         try:
             st = os.stat(path)
@@ -220,11 +240,19 @@ def scan_folder(
         else:
             to_hash.append(path)
 
+    stopped_early = False
     if to_hash:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_hash_one, p): p for p in to_hash}
             done = 0
             for future in as_completed(futures):
+                if cancelled():
+                    stopped_early = True
+                    # Drop whatever has not started yet; the ones already
+                    # running finish, and the context manager waits for those.
+                    for pending in futures:
+                        pending.cancel()
+                    break
                 done += 1
                 path = futures[future]
                 try:
@@ -233,7 +261,7 @@ def scan_folder(
                     failed.append((path, str(exc)))
                 if on_progress and done % 8 == 0:
                     on_progress(done, total, path)
-    if on_progress:
+    if on_progress and not stopped_early:
         on_progress(total, total, "")
 
     if cache_dir:
@@ -255,6 +283,11 @@ def scan_folder(
                 record.height,
             )
         save_index_cache(cache_dir, root, updated)
+
+    if stopped_early:
+        # The index above keeps the hashes that did complete, so a later scan
+        # only has to do the rest.
+        raise ScanCancelled(f"Cancelled while hashing {root}")
 
     groups, uniques = _group_records(records, threshold)
     groups.sort(key=lambda g: (-len(g), g[0].path.lower()))
