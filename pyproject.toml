@@ -12,6 +12,11 @@ dependencies = [
     "Pillow>=11.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.10",
+]
+
 [project.scripts]
 image-dup = "image_duplicates.gallery:main"
 
