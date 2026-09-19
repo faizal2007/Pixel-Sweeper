@@ -13,9 +13,14 @@ from io import BytesIO
 
 from PIL import Image, ImageOps
 from PyQt6.QtCore import (
+    QAbstractItemModel,
     QAbstractListModel,
     QDir,
+    QEvent,
+    QFile,
     QModelIndex,
+    QPointF,
+    QRect,
     QSettings,
     QSize,
     QStandardPaths,
@@ -24,7 +29,17 @@ from PyQt6.QtCore import (
     QTimer,
     pyqtSignal,
 )
-from PyQt6.QtGui import QFileSystemModel, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtGui import (
+    QColor,
+    QFileSystemModel,
+    QFontMetrics,
+    QKeySequence,
+    QPainter,
+    QPalette,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -40,6 +55,9 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QScrollArea,
     QSplitter,
+    QStyle,
+    QStyleOptionViewItem,
+    QStyledItemDelegate,
     QToolBar,
     QTreeView,
     QTreeWidget,
@@ -83,6 +101,17 @@ def _thumb_disk_path(path: str) -> str:
         os.path.normcase(os.path.abspath(path)).encode("utf-8")
     ).hexdigest()[:24]
     return os.path.join(root, f"thumb-{digest}{stat_key}.png")
+
+
+def _forget_thumb(path: str) -> None:
+    """Drop the cached thumbnail of a file that no longer exists."""
+    _THUMB_CACHE.pop(path, None)
+    disk_path = _thumb_disk_path(path)
+    if disk_path:
+        try:
+            os.remove(disk_path)
+        except OSError:
+            pass
 
 
 def _thumb_pixmap(path: str) -> QPixmap:
@@ -140,14 +169,30 @@ def _hsize(value: int) -> str:
 
 
 class ThumbnailModel(QAbstractListModel):
-    """Model exposing lazy, cached thumbnails and captions."""
+    """Model exposing lazy, cached thumbnails, captions and a tick state.
+
+    The tick state lives here (as ``CheckStateRole``) rather than in the view
+    so it survives repaints and resizes, and so the deletion code has a single
+    place to ask "what did the user pick?".
+    """
+
+    checked_changed = pyqtSignal()
 
     def __init__(self, records: list[ImageRecord], parent: QWidget | None = None):
         super().__init__(parent)
         self.records = list(records)
+        self._checked: set[str] = set()
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.records)
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        # Not ItemIsUserCheckable: the delegate alone paints the box and turns
+        # clicks into ticks, so Qt's own checkable machinery (indicator, and the
+        # QCheckBox editor it can drop on top of the tile) stays out of the way.
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
         if not index.isValid() or not (0 <= index.row() < len(self.records)):
@@ -159,10 +204,320 @@ class ThumbnailModel(QAbstractListModel):
             return f"{record.path}\n{record.width} x {record.height}  {_hsize(record.size)}"
         if role == Qt.ItemDataRole.DisplayRole:
             return os.path.basename(record.path)
+        if role == Qt.ItemDataRole.CheckStateRole:
+            return (
+                Qt.CheckState.Checked
+                if record.path in self._checked
+                else Qt.CheckState.Unchecked
+            )
         return None
+
+    def setData(
+        self,
+        index: QModelIndex,
+        value: object,
+        role: int = Qt.ItemDataRole.EditRole,
+    ) -> bool:
+        if role != Qt.ItemDataRole.CheckStateRole or not index.isValid():
+            return False
+        checked = Qt.CheckState(value) == Qt.CheckState.Checked
+        self._notify(self._apply([index.row()], checked))
+        return True
+
+    def is_checked(self, row: int) -> bool:
+        return 0 <= row < len(self.records) and self.records[row].path in self._checked
+
+    def checked_count(self) -> int:
+        return sum(1 for record in self.records if record.path in self._checked)
+
+    def checked_paths(self) -> list[str]:
+        """Ticked paths in the order the gallery shows them."""
+        return [record.path for record in self.records if record.path in self._checked]
+
+    def toggle_checked(self, rows: list[int], checked: bool | None = None) -> None:
+        """Tick ``rows``. With ``checked=None`` the state of the first row is
+        inverted and applied to all of them (what Space does)."""
+        if not rows:
+            return
+        if checked is None:
+            checked = not self.is_checked(rows[0])
+        self._notify(self._apply(rows, checked))
+
+    def set_all_checked(self, checked: bool, rows: list[int] | None = None) -> None:
+        target = range(len(self.records)) if rows is None else rows
+        self._notify(self._apply(list(target), checked))
+
+    def _apply(self, rows: list[int], checked: bool) -> list[int]:
+        """Store the new state and return only the rows that really changed."""
+        changed: list[int] = []
+        for row in rows:
+            if not 0 <= row < len(self.records):
+                continue
+            path = self.records[row].path
+            if checked == (path in self._checked):
+                continue
+            if checked:
+                self._checked.add(path)
+            else:
+                self._checked.discard(path)
+            changed.append(row)
+        return changed
+
+    def _notify(self, changed: list[int]) -> None:
+        if not changed:
+            return
+        self.dataChanged.emit(
+            self.index(min(changed), 0),
+            self.index(max(changed), 0),
+            [Qt.ItemDataRole.CheckStateRole],
+        )
+        self.checked_changed.emit()
+
+
+_CHECK_COLOR = QColor("#1a73e8")
+_CHECK_SIZE = 22
+_STRIP_HEIGHT = 30  # caption row: tick box + filename, always below the picture
+_STRIP_PAD = 6
+_CELL_EXTRA = 8  # keeps a little air either side of the widest thumbnail
+
+
+def _image_area(item_rect: QRect) -> QRect:
+    """The part of a tile that holds the picture."""
+    return QRect(
+        item_rect.left(),
+        item_rect.top(),
+        item_rect.width(),
+        max(0, item_rect.height() - _STRIP_HEIGHT),
+    )
+
+
+def _caption_strip(item_rect: QRect) -> QRect:
+    """The bottom row of a tile. The tick box lives here, so it can never
+    cover the image."""
+    height = min(_STRIP_HEIGHT, max(0, item_rect.height()))
+    return QRect(
+        item_rect.left(),
+        item_rect.bottom() - height + 1,
+        item_rect.width(),
+        height,
+    )
+
+
+def _checkbox_rect(item_rect: QRect) -> QRect:
+    """Where the tick box sits inside one tile."""
+    strip = _caption_strip(item_rect)
+    return QRect(
+        strip.left() + _STRIP_PAD,
+        strip.top() + max(0, (strip.height() - _CHECK_SIZE) // 2),
+        _CHECK_SIZE,
+        _CHECK_SIZE,
+    )
+
+
+class ThumbnailDelegate(QStyledItemDelegate):
+    """Draws exactly one tick box per tile, in a caption row under the image.
+
+    The box is painted here in full, instead of drawing with
+    ``QStyledItemDelegate.paint`` and adding the box on top. That is not just
+    tidiness: ``initStyleOption`` (called inside the base ``paint``) sets
+    ``HasCheckIndicator`` whenever ``CheckStateRole`` holds a value, so the base
+    paints Qt's own checkbox as well - two boxes per tile, one of them at the
+    style's own spot on the picture. Painting everything here means the style
+    only ever draws the background, and the single box is ours.
+    """
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
+        # One size for every tile keeps the grid even and guarantees room for
+        # both the picture and the caption row.
+        return QSize(_THUMB_PIXEL + _CELL_EXTRA, _THUMB_PIXEL + _STRIP_HEIGHT)
+
+    def paint(
+        self,
+        painter: QPainter | None,
+        option: QStyleOptionViewItem,
+        index: QModelIndex,
+    ) -> None:
+        if painter is None:
+            return
+        style = (
+            option.widget.style()
+            if option.widget is not None
+            else QApplication.style()
+        )
+        # Background and selection only - no text, no icon, no check indicator.
+        background = QStyleOptionViewItem(option)
+        background.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+        style.drawPrimitive(
+            QStyle.PrimitiveElement.PE_PanelItemViewItem,
+            background,
+            painter,
+            option.widget,
+        )
+        if option.state & QStyle.StateFlag.State_HasFocus:
+            style.drawPrimitive(
+                QStyle.PrimitiveElement.PE_FrameFocusRect,
+                background,
+                painter,
+                option.widget,
+            )
+
+        checked = index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        area = _image_area(option.rect)
+        strip = _caption_strip(option.rect)
+        box = _checkbox_rect(option.rect)
+
+        # The picture, centred in its own area and never blown up.
+        thumbnail = index.data(Qt.ItemDataRole.DecorationRole)
+        if isinstance(thumbnail, QPixmap) and not thumbnail.isNull():
+            shown = thumbnail
+            if shown.width() > area.width() or shown.height() > area.height():
+                shown = shown.scaled(
+                    area.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            painter.drawPixmap(
+                area.left() + (area.width() - shown.width()) // 2,
+                area.top() + (area.height() - shown.height()) // 2,
+                shown,
+            )
+
+        # A tint confined to the caption row, so nothing covers the picture.
+        if checked:
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(26, 115, 232, 40))
+            painter.drawRoundedRect(strip.adjusted(1, 1, -1, -1), 4, 4)
+            painter.restore()
+
+        self._paint_box(painter, option, box, checked)
+
+        metrics = QFontMetrics(option.font)
+        text_left = box.right() + _STRIP_PAD
+        text_rect = QRect(
+            text_left,
+            strip.top(),
+            max(0, strip.right() - text_left),
+            strip.height(),
+        )
+        name = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        if checked:
+            colour = _CHECK_COLOR
+        elif selected:
+            colour = option.palette.color(QPalette.ColorRole.HighlightedText)
+        else:
+            colour = option.palette.color(QPalette.ColorRole.Text)
+        painter.save()
+        painter.setPen(colour)
+        painter.setFont(option.font)
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            metrics.elidedText(name, Qt.TextElideMode.ElideMiddle, text_rect.width()),
+        )
+        painter.restore()
+
+    @staticmethod
+    def _paint_box(
+        painter: QPainter,
+        option: QStyleOptionViewItem,
+        box: QRect,
+        checked: bool,
+    ) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if checked:
+            painter.setPen(QPen(_CHECK_COLOR, 2))
+            painter.setBrush(_CHECK_COLOR)
+            painter.drawRoundedRect(box, 5, 5)
+            pen = QPen(QColor("#ffffff"), 3)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            x, y, w, h = box.x(), box.y(), box.width(), box.height()
+            painter.drawLine(
+                QPointF(x + w * 0.24, y + h * 0.54), QPointF(x + w * 0.44, y + h * 0.74)
+            )
+            painter.drawLine(
+                QPointF(x + w * 0.44, y + h * 0.74), QPointF(x + w * 0.77, y + h * 0.29)
+            )
+        else:
+            painter.setPen(QPen(option.palette.color(QPalette.ColorRole.Mid), 2))
+            painter.setBrush(option.palette.color(QPalette.ColorRole.Base))
+            painter.drawRoundedRect(box, 5, 5)
+        painter.restore()
+
+    def editorEvent(
+        self,
+        event: QEvent | None,
+        model: QAbstractItemModel,
+        option: QStyleOptionViewItem,
+        index: QModelIndex,
+    ) -> bool:
+        """Turns a click on the box into a tick; the box is the only target.
+
+        The base implementation would additionally toggle inside the
+        style-computed indicator rect, which is *not* where we paint the box -
+        clicking there would flip an invisible checkbox. So mouse events are
+        handled here in full and never passed on.
+        """
+        if event is None:
+            return False
+
+        kind = event.type()
+        if kind not in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseButtonDblClick,
+        ):
+            return super().editorEvent(event, model, option, index)
+
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        if not _checkbox_rect(option.rect).contains(event.position().toPoint()):
+            return False
+
+        if kind == QEvent.Type.MouseButtonPress:
+            model.setData(
+                index,
+                Qt.CheckState.Unchecked
+                if index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
+                else Qt.CheckState.Checked,
+                Qt.ItemDataRole.CheckStateRole,
+            )
+        # Consume the matching release / double click: it must not toggle a
+        # second time, and it must not open the preview either.
+        return True
+
+
+class ThumbnailList(QListView):
+    """Icon-mode list that keeps double clicks off the tick boxes."""
+
+    toggle_selection_requested = pyqtSignal()
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt override
+        index = self.indexAt(event.position().toPoint())
+        if index.isValid() and _checkbox_rect(self.visualRect(index)).contains(
+            event.position().toPoint()
+        ):
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.key() == Qt.Key.Key_Space:
+            self.toggle_selection_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class GalleryView(QWidget):
+    """Thumbnail grid with a tick box per image and a delete action."""
+
+    delete_requested = pyqtSignal(list)
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.model: ThumbnailModel | None = None
@@ -171,28 +526,120 @@ class GalleryView(QWidget):
         self.title.setWordWrap(True)
         self.title.setStyleSheet("font-weight: 700; padding: 4px;")
 
-        self.list = QListView()
+        self.hint = QLabel(
+            "Tick the images you want to remove - click the box in the corner of "
+            "a thumbnail, or select some and press Space - then press Delete Checked."
+        )
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color: palette(mid); padding: 0 4px 2px 4px;")
+
+        self.check_all_button = QPushButton("Check All")
+        self.check_all_button.setToolTip("Tick every image shown here.")
+        self.check_all_button.clicked.connect(self._check_every_image)
+
+        self.uncheck_all_button = QPushButton("Uncheck All")
+        self.uncheck_all_button.setToolTip("Remove every tick.")
+        self.uncheck_all_button.clicked.connect(self._clear_every_tick)
+
+        self.check_rest_button = QPushButton("Check All Except First")
+        self.check_rest_button.setToolTip(
+            "Keep the first image of this duplicate group and tick the others, "
+            "so a group can be cleaned up in one click."
+        )
+        self.check_rest_button.clicked.connect(self._check_all_but_first)
+
+        self.delete_button = QPushButton("Delete Checked")
+        self.delete_button.setToolTip(
+            "Move the ticked images to the recycle bin, where they stay recoverable."
+        )
+        self.delete_button.setEnabled(False)
+        self.delete_button.clicked.connect(self._delete_checked)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(4, 0, 4, 0)
+        actions.addWidget(self.check_all_button)
+        actions.addWidget(self.uncheck_all_button)
+        actions.addWidget(self.check_rest_button)
+        actions.addStretch(1)
+        actions.addWidget(self.delete_button)
+
+        self.list = ThumbnailList()
         self.list.setViewMode(QListView.ViewMode.IconMode)
         self.list.setMovement(QListView.Movement.Static)
         self.list.setResizeMode(QListView.ResizeMode.Adjust)
         self.list.setUniformItemSizes(True)
         self.list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.list.setGridSize(QSize(_THUMB_PIXEL + 12, _THUMB_PIXEL + 42))
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list.setGridSize(QSize(_THUMB_PIXEL + 12, _THUMB_PIXEL + _STRIP_HEIGHT + 6))
         self.list.setIconSize(QSize(_THUMB_PIXEL, _THUMB_PIXEL))
+        self.list.setItemDelegate(ThumbnailDelegate(self.list))
         self.list.doubleClicked.connect(self._open_viewer)
+        self.list.toggle_selection_requested.connect(self._toggle_selected)
+
+        delete_shortcut = QShortcut(QKeySequence("Delete"), self)
+        delete_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        delete_shortcut.activated.connect(self._delete_checked)
 
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(4, 4, 4, 4)
         self.layout.addWidget(self.title)
+        self.layout.addWidget(self.hint)
+        self.layout.addLayout(actions)
         self.layout.addWidget(self.list, 1)
 
     def show_raw_folder(self):
         self.set_records([], "Open a folder, or choose one in the toolbar.")
 
     def set_records(self, records: list[ImageRecord], heading: str) -> None:
+        previous = self.model
         self.model = ThumbnailModel(records, self)
+        self.model.checked_changed.connect(self._on_checked_changed)
         self.list.setModel(self.model)
         self.title.setText(heading)
+        self._on_checked_changed()
+        if previous is not None:
+            # Every click in the tree builds a fresh model; release the old one
+            # instead of letting it pile up as an unused child widget.
+            previous.deleteLater()
+
+    def _selected_rows(self) -> list[int]:
+        selection = self.list.selectionModel()
+        if selection is None:
+            return []
+        return sorted(index.row() for index in selection.selectedIndexes())
+
+    def _toggle_selected(self) -> None:
+        if self.model is not None:
+            self.model.toggle_checked(self._selected_rows())
+
+    def _check_every_image(self) -> None:
+        if self.model is not None:
+            self.model.set_all_checked(True)
+
+    def _clear_every_tick(self) -> None:
+        if self.model is not None:
+            self.model.set_all_checked(False)
+
+    def _check_all_but_first(self) -> None:
+        """Keep one copy of a duplicate group, tick the rest."""
+        if self.model is None or not self.model.records:
+            return
+        self.model.set_all_checked(False)
+        self.model.set_all_checked(True, list(range(1, len(self.model.records))))
+
+    def _on_checked_changed(self) -> None:
+        count = self.model.checked_count() if self.model else 0
+        self.delete_button.setText(
+            f"Delete Checked ({count})" if count else "Delete Checked"
+        )
+        self.delete_button.setEnabled(count > 0)
+
+    def _delete_checked(self) -> None:
+        if self.model is None:
+            return
+        paths = self.model.checked_paths()
+        if paths:
+            self.delete_requested.emit(paths)
 
     def _open_viewer(self, index: QModelIndex) -> None:
         if self.model is None or not index.isValid():
@@ -499,6 +946,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
         self.gallery: GalleryView = splitter.widget(1)
+        self.gallery.delete_requested.connect(self.move_checked_to_trash)
 
         self.folder_picker = FolderPickerDialog(self)
         self.folder_picker.folder_chosen.connect(self.start_scan)
@@ -583,6 +1031,60 @@ class MainWindow(QMainWindow):
         next_folder, self.pending_folder = self.pending_folder, None
         if next_folder:
             self.start_scan(next_folder)
+
+    def move_checked_to_trash(self, paths: list[str]) -> None:
+        """Move the images the user ticked to the recycle bin, then re-scan."""
+        existing = [path for path in paths if os.path.isfile(path)]
+        if not existing:
+            self.status.showMessage("Those images are already gone - re-scanning.")
+            if self.current_folder:
+                self.start_scan(self.current_folder)
+            return
+
+        sizes: dict[str, int] = {}
+        for path in existing:
+            try:
+                sizes[path] = os.path.getsize(path)
+            except OSError:
+                sizes[path] = 0
+
+        answer = QMessageBox.question(
+            self,
+            "Move to recycle bin",
+            f"Move {len(existing)} image(s) ({_hsize(sum(sizes.values()))}) to the "
+            "recycle bin?\n\nThey stay recoverable there, and nothing else is touched.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        moved: list[str] = []
+        failed: list[str] = []
+        for path in existing:
+            if QFile.moveToTrash(path):
+                moved.append(path)
+                _forget_thumb(path)
+            else:
+                failed.append(path)
+
+        if failed:
+            preview = "\n".join(failed[:8])
+            if len(failed) > 8:
+                preview += f"\n... and {len(failed) - 8} more"
+            QMessageBox.warning(
+                self,
+                "Some images were not moved",
+                f"{len(failed)} of {len(existing)} image(s) could not be moved to "
+                f"the recycle bin:\n{preview}",
+            )
+
+        freed = _hsize(sum(sizes[path] for path in moved))
+        self.status.showMessage(
+            f"Moved {len(moved)} image(s) to the recycle bin ({freed}) - re-scanning..."
+        )
+        if self.current_folder:
+            self.start_scan(self.current_folder)
 
     def _update_counts(self, result: ScanResult) -> None:
         wasted = _hsize(result.wasted_bytes)
