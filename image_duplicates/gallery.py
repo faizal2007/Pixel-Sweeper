@@ -6,6 +6,7 @@ Usage: ``python main.py [folder]`` or pick a folder from the toolbar.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 from io import BytesIO
